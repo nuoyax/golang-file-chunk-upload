@@ -69,3 +69,28 @@ Distributed: The example uploadLocks is a single-instance memory lock; for multi
 Security: For production environments, please implement authentication, rate limiting, flow control, path whitelisting, DDOS prevention, and verification of uploader permissions for upload_id.
 
 Garbage removal: Implement a background task to clean up records with uploads.status = 'in_progress' and a created_at value exceeding the TTL, and delete the tmp folder.
+
+
+CREATE TABLE uploads (
+  upload_id VARCHAR(64) PRIMARY KEY,
+  file_name VARCHAR(255) NOT NULL,
+  total_size BIGINT NOT NULL,
+  chunk_size INT NOT NULL,
+  total_chunks INT NOT NULL,
+  status ENUM('in_progress','completed','failed') DEFAULT 'in_progress',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  extra JSON NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE upload_chunks (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  upload_id VARCHAR(64),
+  chunk_index INT,
+  chunk_size INT,
+  chunk_md5 VARCHAR(64),
+  received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY (upload_id, chunk_index),
+  INDEX (upload_id),
+  FOREIGN KEY (upload_id) REFERENCES uploads(upload_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
