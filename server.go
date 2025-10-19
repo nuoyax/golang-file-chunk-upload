@@ -2,163 +2,159 @@
 package main
 
 import (
-	"crypto/md5"
-	"database/sql"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
+	"crypto/md5"      // MD5哈希计算
+	"database/sql"     // 数据库操作
+	"encoding/hex"     // 十六进制编码
+	"encoding/json"    // JSON编解码
+	"fmt"              // 格式化IO
+	"io"               // IO操作
+	"log"              // 日志
+	"net/http"         // HTTP服务
+	"os"               // 操作系统功能
+	"path/filepath"    // 文件路径处理
+	"strconv"          // 字符串转换
+	"strings"          // 字符串处理
+	"sync"             // 同步原语
+	"time"             // 时间处理
 
-	_ "github.com/go-sql-driver/mysql"
-	"github.com/google/uuid"
-	"github.com/gorilla/mux"
-	"github.com/rs/cors"
+	_ "github.com/go-sql-driver/mysql" // MySQL驱动
+	"github.com/google/uuid"           // UUID生成
+	"github.com/gorilla/mux"           // HTTP路由
+	"github.com/rs/cors"               // CORS处理
 )
 
+// 全局变量
 var (
-	db            *sql.DB
-	tmpDir        = "./tmp_uploads"
-	finalDir      = "./store"
-	uploadLocks   = make(map[string]*sync.Mutex)
-	uploadLocksMu sync.Mutex
+	db            *sql.DB           // 数据库连接
+	tmpDir        = "./tmp_uploads" // 临时上传目录
+	finalDir      = "./store"       // 最终文件存储目录
+	uploadLocks   = make(map[string]*sync.Mutex) // 上传任务锁映射
+	uploadLocksMu sync.Mutex         // 保护uploadLocks的互斥锁
 )
 
-// Request/Response Models
-type (
-	// UploadRequest 创建上传任务请求
-	UploadRequest struct {
-		FileName  string `json:"file_name" binding:"required"`
-		TotalSize int64  `json:"total_size" binding:"required,min=1"`
-		ChunkSize int    `json:"chunk_size" binding:"required,min=1"`
-		MD5       string `json:"md5,omitempty"`
-	}
+// 请求/响应模型定义
 
-	// UploadResponse 创建上传任务响应
-	UploadResponse struct {
-		UploadID    string `json:"upload_id"`
-		ChunkSize   int    `json:"chunk_size"`
-		TotalChunks int    `json:"total_chunks"`
-	}
+// UploadRequest 创建上传任务请求
+type UploadRequest struct {
+	FileName  string `json:"file_name" binding:"required"`   // 文件名
+	TotalSize int64  `json:"total_size" binding:"required,min=1"` // 文件总大小
+	ChunkSize int    `json:"chunk_size" binding:"required,min=1"` // 分片大小
+	MD5       string `json:"md5,omitempty"` // 文件MD5（可选）
+}
 
-	// ChunkUploadResponse 分片上传响应
-	ChunkUploadResponse struct {
-		Index int    `json:"index"`
-		Size  int64  `json:"size"`
-		MD5   string `json:"md5"`
-	}
+// UploadResponse 创建上传任务响应
+type UploadResponse struct {
+	UploadID    string `json:"upload_id"`    // 上传任务ID
+	ChunkSize   int    `json:"chunk_size"`   // 分片大小
+	TotalChunks int    `json:"total_chunks"` // 总分片数
+}
 
-	// UploadStatusResponse 上传状态响应
-	UploadStatusResponse struct {
-		UploadID string `json:"upload_id"`
-		Status   string `json:"status"`
-		Chunks   []int  `json:"chunks"`
-		Progress struct {
-			Completed int `json:"completed"`
-			Total     int `json:"total"`
-			Percent   int `json:"percent"`
-		} `json:"progress"`
-	}
+// ChunkUploadResponse 分片上传响应
+type ChunkUploadResponse struct {
+	Index int    `json:"index"` // 分片索引
+	Size  int64  `json:"size"`  // 分片大小
+	MD5   string `json:"md5"`   // 分片MD5
+}
 
-	// CompleteResponse 完成上传响应
-	CompleteResponse struct {
-		Status    string `json:"status"`
-		FinalPath string `json:"final_path"`
-		FileSize  int64  `json:"file_size"`
-		MD5       string `json:"md5,omitempty"`
-	}
+// UploadStatusResponse 上传状态响应
+type UploadStatusResponse struct {
+	UploadID string `json:"upload_id"` // 上传任务ID
+	Status   string `json:"status"`    // 状态
+	Chunks   []int  `json:"chunks"`    // 已上传分片列表
+	Progress struct {
+		Completed int `json:"completed"` // 已完成分片数
+		Total     int `json:"total"`     // 总分片数
+		Percent   int `json:"percent"`   // 完成百分比
+	} `json:"progress"` // 进度信息
+}
 
-	// ErrorResponse 错误响应
-	ErrorResponse struct {
-		Error   string `json:"error"`
-		Code    int    `json:"code"`
-		Message string `json:"message,omitempty"`
-	}
+// CompleteResponse 完成上传响应
+type CompleteResponse struct {
+	Status    string `json:"status"`     // 状态
+	FinalPath string `json:"final_path"` // 最终文件路径
+	FileSize  int64  `json:"file_size"`  // 文件大小
+	MD5       string `json:"md5,omitempty"` // 文件MD5
+}
 
-	// FileHistoryResponse 文件历史记录响应
-	FileHistoryResponse struct {
-		Total   int           `json:"total"`
-		Page    int           `json:"page"`
-		PerPage int           `json:"per_page"`
-		Files   []*FileRecord `json:"files"`
-	}
+// ErrorResponse 错误响应
+type ErrorResponse struct {
+	Error   string `json:"error"`    // 错误类型
+	Code    int    `json:"code"`     // 错误码
+	Message string `json:"message,omitempty"` // 错误消息
+}
 
-	// FileRecord 文件记录
-	FileRecord struct {
-		UploadID    string    `json:"upload_id"`
-		FileName    string    `json:"file_name"`
-		FileSize    int64     `json:"file_size"`
-		Status      string    `json:"status"`
-		ChunkSize   int       `json:"chunk_size"`
-		TotalChunks int       `json:"total_chunks"`
-		CreatedAt   time.Time `json:"created_at"`
-		UpdatedAt   time.Time `json:"updated_at"`
-		CompletedAt *time.Time `json:"completed_at,omitempty"`
-	}
+// FileHistoryResponse 文件历史记录响应
+type FileHistoryResponse struct {
+	Total   int           `json:"total"`    // 总数
+	Page    int           `json:"page"`     // 当前页
+	PerPage int           `json:"per_page"` // 每页数量
+	Files   []*FileRecord `json:"files"`    // 文件记录列表
+}
 
-	// FileHistoryQuery 文件历史查询参数
-	FileHistoryQuery struct {
-		Page    int    `json:"page"`
-		PerPage int    `json:"per_page"`
-		Status  string `json:"status"`
-		Keyword string `json:"keyword"`
-		SortBy  string `json:"sort_by"`
-		Order   string `json:"order"`
-	}
+// FileRecord 文件记录
+type FileRecord struct {
+	UploadID    string    `json:"upload_id"`    // 上传任务ID
+	FileName    string    `json:"file_name"`    // 文件名
+	FileSize    int64     `json:"file_size"`    // 文件大小
+	Status      string    `json:"status"`       // 状态
+	ChunkSize   int       `json:"chunk_size"`   // 分片大小
+	TotalChunks int       `json:"total_chunks"` // 总分片数
+	CreatedAt   time.Time `json:"created_at"`   // 创建时间
+	UpdatedAt   time.Time `json:"updated_at"`   // 更新时间
+	CompletedAt *time.Time `json:"completed_at,omitempty"` // 完成时间
+}
 
-	// FileStatsResponse 文件统计响应
-	FileStatsResponse struct {
-		TotalCount       int64   `json:"total_count"`
-		CompletedCount   int64   `json:"completed_count"`
-		TotalSize        int64   `json:"total_size"`
-		TodayUploadCount int64   `json:"today_upload_count"`
-		SuccessRate      float64 `json:"success_rate"`
-		AverageFileSize  float64 `json:"average_file_size"`
-	}
+// FileHistoryQuery 文件历史查询参数
+type FileHistoryQuery struct {
+	Page    int    `json:"page"`     // 页码
+	PerPage int    `json:"per_page"` // 每页数量
+	Status  string `json:"status"`   // 状态过滤
+	Keyword string `json:"keyword"`  // 关键词搜索
+	SortBy  string `json:"sort_by"`  // 排序字段
+	Order   string `json:"order"`    // 排序方向
+}
 
-	// TodayUploadStatsResponse 今日上传统计响应
-	TodayUploadStatsResponse struct {
-		Count     int64 `json:"count"`
-		TotalSize int64 `json:"total_size"`
-	}
+// FileStatsResponse 文件统计响应
+type FileStatsResponse struct {
+	TotalCount       int64   `json:"total_count"`        // 总文件数
+	CompletedCount   int64   `json:"completed_count"`    // 已完成文件数
+	TotalSize        int64   `json:"total_size"`         // 总文件大小
+	TodayUploadCount int64   `json:"today_upload_count"` // 今日上传数量
+	SuccessRate      float64 `json:"success_rate"`       // 成功率
+	AverageFileSize  float64 `json:"average_file_size"`  // 平均文件大小
+}
 
-	// RecentFile 最近上传的文件
-	RecentFile struct {
-		UploadID   string    `json:"upload_id"`
-		FileName   string    `json:"file_name"`
-		FileSize   int64     `json:"file_size"`
-		Status     string    `json:"status"`
-		CreatedAt  time.Time `json:"created_at"`
-		UpdatedAt  time.Time `json:"updated_at"`
-	}
+// TodayUploadStatsResponse 今日上传统计响应
+type TodayUploadStatsResponse struct {
+	Count     int64 `json:"count"`      // 今日上传数量
+	TotalSize int64 `json:"total_size"` // 今日上传总大小
+}
 
-	// RecentFilesResponse 最近文件响应
-	RecentFilesResponse struct {
-		Files []*RecentFile `json:"files"`
-	}
-)
+// RecentFile 最近上传的文件
+type RecentFile struct {
+	UploadID  string    `json:"upload_id"`  // 上传任务ID
+	FileName  string    `json:"file_name"`  // 文件名
+	FileSize  int64     `json:"file_size"`  // 文件大小
+	Status    string    `json:"status"`     // 状态
+	CreatedAt time.Time `json:"created_at"` // 创建时间
+	UpdatedAt time.Time `json:"updated_at"` // 更新时间
+}
 
+// RecentFilesResponse 最近文件响应
+type RecentFilesResponse struct {
+	Files []*RecentFile `json:"files"` // 最近文件列表
+}
 
-
-
-// Constants
+// 常量定义
 const (
-	StatusInProgress = "in_progress"
-	StatusCompleted  = "completed"
-	StatusFailed     = "failed"
+	StatusInProgress = "in_progress" // 上传中状态
+	StatusCompleted  = "completed"   // 已完成状态
+	StatusFailed     = "failed"      // 失败状态
 
-	DefaultPage    = 1
-	DefaultPerPage = 20
-	MaxPerPage     = 100
+	DefaultPage    = 1   // 默认页码
+	DefaultPerPage = 20  // 默认每页数量
+	MaxPerPage     = 100 // 最大每页数量
 )
-
 
 // GetFileStats 获取文件统计信息
 // GET /api/v1/files/stats
@@ -306,9 +302,9 @@ func GetRecentFiles(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// 辅助函数
 
-
-// Helper functions
+// getUploadLock 获取或创建上传任务的互斥锁
 func getUploadLock(uploadID string) *sync.Mutex {
 	uploadLocksMu.Lock()
 	defer uploadLocksMu.Unlock()
@@ -320,12 +316,14 @@ func getUploadLock(uploadID string) *sync.Mutex {
 	return m
 }
 
+// writeJSON 写入JSON响应
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
 }
 
+// writeError 写入错误响应
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, ErrorResponse{
 		Error:   http.StatusText(status),
@@ -334,6 +332,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	})
 }
 
+// parseQueryParams 解析查询参数
 func parseQueryParams(r *http.Request) *FileHistoryQuery {
 	query := &FileHistoryQuery{
 		Page:    DefaultPage,
@@ -378,20 +377,20 @@ func parseQueryParams(r *http.Request) *FileHistoryQuery {
 	return query
 }
 
-// Database initialization
+// initDB 初始化数据库连接
 func initDB(dsn string) error {
 	var err error
 	db, err = sql.Open("mysql", dsn)
 	if err != nil {
 		return err
 	}
-	db.SetConnMaxLifetime(time.Minute * 3)
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(10)
-	return db.Ping()
+	db.SetConnMaxLifetime(time.Minute * 3) // 连接最大生命周期
+	db.SetMaxOpenConns(10)                 // 最大打开连接数
+	db.SetMaxIdleConns(10)                 // 最大空闲连接数
+	return db.Ping()                       // 测试连接
 }
 
-// Handlers
+// 处理器函数
 
 // CreateUpload 创建上传任务
 // POST /api/v1/uploads
@@ -402,14 +401,17 @@ func CreateUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 验证必需字段
 	if req.FileName == "" || req.TotalSize <= 0 || req.ChunkSize <= 0 {
 		writeError(w, http.StatusBadRequest, "Missing or invalid required fields: file_name, total_size, chunk_size")
 		return
 	}
 
+	// 计算总分片数
 	totalChunks := int((req.TotalSize + int64(req.ChunkSize) - 1) / int64(req.ChunkSize))
-	uploadID := uuid.New().String()
+	uploadID := uuid.New().String() // 生成唯一上传ID
 
+	// 插入数据库记录
 	_, err := db.Exec(
 		"INSERT INTO uploads (upload_id, file_name, total_size, chunk_size, total_chunks, status) VALUES (?, ?, ?, ?, ?, ?)",
 		uploadID, req.FileName, req.TotalSize, req.ChunkSize, totalChunks, StatusInProgress,
@@ -420,7 +422,7 @@ func CreateUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create temporary directory for chunks
+	// 创建临时目录存储分片
 	_ = os.MkdirAll(filepath.Join(tmpDir, uploadID), 0755)
 
 	resp := UploadResponse{
@@ -438,13 +440,14 @@ func UploadChunk(w http.ResponseWriter, r *http.Request) {
 	uploadID := vars["upload_id"]
 	indexStr := vars["index"]
 
+	// 解析分片索引
 	index, err := strconv.Atoi(indexStr)
 	if err != nil || index < 0 {
 		writeError(w, http.StatusBadRequest, "Invalid chunk index")
 		return
 	}
 
-	// Get upload info
+	// 获取上传任务信息
 	var chunkSize, totalChunks int
 	var status string
 	err = db.QueryRow(
@@ -461,22 +464,24 @@ func UploadChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 验证状态
 	if status != StatusInProgress {
 		writeError(w, http.StatusBadRequest, "Upload is not in progress")
 		return
 	}
 
+	// 验证分片索引范围
 	if index >= totalChunks {
 		writeError(w, http.StatusBadRequest, "Chunk index out of range")
 		return
 	}
 
-	// Create temporary directory
+	// 创建临时目录
 	tmpPath := filepath.Join(tmpDir, uploadID)
 	_ = os.MkdirAll(tmpPath, 0755)
 	chunkPath := filepath.Join(tmpPath, fmt.Sprintf("chunk_%06d", index))
 
-	// Create temporary file
+	// 创建临时文件
 	tmpFile, err := os.Create(chunkPath + ".part")
 	if err != nil {
 		log.Println("Create chunk file error:", err)
@@ -485,9 +490,9 @@ func UploadChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tmpFile.Close()
 
-	// Read and write chunk data with MD5 calculation
+	// 读取并写入分片数据，同时计算MD5
 	hasher := md5.New()
-	mw := io.MultiWriter(tmpFile, hasher)
+	mw := io.MultiWriter(tmpFile, hasher) // 多写器：同时写入文件和计算哈希
 	n, err := io.Copy(mw, r.Body)
 	if err != nil {
 		log.Println("Write chunk error:", err)
@@ -498,14 +503,14 @@ func UploadChunk(w http.ResponseWriter, r *http.Request) {
 
 	chunkMD5 := hex.EncodeToString(hasher.Sum(nil))
 
-	// Atomically rename temporary file
+	// 原子性重命名临时文件
 	if err := os.Rename(chunkPath+".part", chunkPath); err != nil {
 		log.Println("Rename chunk file error:", err)
 		writeError(w, http.StatusInternalServerError, "Server error")
 		return
 	}
 
-	// Save chunk metadata to database
+	// 保存分片元数据到数据库
 	_, err = db.Exec(`
 		INSERT INTO upload_chunks (upload_id, chunk_index, chunk_size, chunk_md5)
 		VALUES (?, ?, ?, ?)
@@ -533,7 +538,7 @@ func UploadChunk(w http.ResponseWriter, r *http.Request) {
 func GetUploadStatus(w http.ResponseWriter, r *http.Request) {
 	uploadID := mux.Vars(r)["upload_id"]
 
-	// Get upload basic info
+	// 获取上传基本信息
 	var fileName string
 	var totalSize int64
 	var chunkSize, totalChunks int
@@ -552,7 +557,7 @@ func GetUploadStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get uploaded chunks
+	// 获取已上传的分片
 	rows, err := db.Query("SELECT chunk_index FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index", uploadID)
 	if err != nil {
 		log.Println("Database query chunks error:", err)
@@ -568,7 +573,7 @@ func GetUploadStatus(w http.ResponseWriter, r *http.Request) {
 		chunks = append(chunks, idx)
 	}
 
-	// Build response
+	// 构建响应
 	resp := UploadStatusResponse{
 		UploadID: uploadID,
 		Status:   status,
@@ -588,10 +593,10 @@ func GetUploadStatus(w http.ResponseWriter, r *http.Request) {
 func CompleteUpload(w http.ResponseWriter, r *http.Request) {
 	uploadID := mux.Vars(r)["upload_id"]
 	lock := getUploadLock(uploadID)
-	lock.Lock()
-	defer lock.Unlock()
+	lock.Lock()         // 加锁防止并发完成
+	defer lock.Unlock() // 确保解锁
 
-	// Fetch upload metadata
+	// 获取上传元数据
 	var fileName string
 	var totalSize int64
 	var chunkSize, totalChunks int
@@ -610,25 +615,27 @@ func CompleteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 检查是否已完成
 	if status == StatusCompleted {
 		writeError(w, http.StatusBadRequest, "Upload already completed")
 		return
 	}
 
-	// Find and validate chunks
+	// 查找并验证分片
 	chunkFiles, missing, err := findAndValidateChunks(uploadID, totalChunks)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
+	// 检查是否有缺失分片
 	if len(missing) > 0 {
 		msg := fmt.Sprintf("Missing chunks: %v (found %d, expected %d)", missing, len(chunkFiles), totalChunks)
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
 
-	// Merge chunks
+	// 合并分片
 	finalPath, fileSize, fileMD5, err := mergeChunks(uploadID, fileName, chunkFiles)
 	if err != nil {
 		log.Println("Merge chunks error:", err)
@@ -636,17 +643,17 @@ func CompleteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update database status - 只更新状态，不更新 final_path 和 file_md5
+	// 更新数据库状态
 	_, err = db.Exec(
 		"UPDATE uploads SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE upload_id = ?",
 		StatusCompleted, uploadID,
 	)
 	if err != nil {
 		log.Println("Database update upload error:", err)
-		// Non-fatal: don't affect client response
+		// 非致命错误：不影响客户端响应
 	}
 
-	// Async cleanup
+	// 异步清理临时分片
 	go cleanupChunks(uploadID)
 
 	log.Printf("Upload %s completed successfully -> %s (size: %d bytes)\n", uploadID, finalPath, fileSize)
@@ -665,7 +672,7 @@ func CompleteUpload(w http.ResponseWriter, r *http.Request) {
 func GetFileHistory(w http.ResponseWriter, r *http.Request) {
 	query := parseQueryParams(r)
 
-	// 构建 WHERE 条件
+	// 构建WHERE条件
 	whereClause := "WHERE 1=1"
 	args := []interface{}{}
 
@@ -813,7 +820,9 @@ func GetFileDetail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, file)
 }
 
-// Helper functions
+// 辅助函数
+
+// getFileByUploadID 根据上传ID获取文件记录
 func getFileByUploadID(uploadID string) (*FileRecord, error) {
 	file := &FileRecord{}
 
@@ -833,6 +842,7 @@ func getFileByUploadID(uploadID string) (*FileRecord, error) {
 		return nil, err
 	}
 
+	// 为已完成文件设置完成时间
 	if file.Status == StatusCompleted {
 		file.CompletedAt = &file.UpdatedAt
 	}
@@ -840,6 +850,7 @@ func getFileByUploadID(uploadID string) (*FileRecord, error) {
 	return file, nil
 }
 
+// findAndValidateChunks 查找并验证分片
 func findAndValidateChunks(uploadID string, totalChunks int) ([]string, []int, error) {
 	tmpPath := filepath.Join(tmpDir, uploadID)
 	pattern := filepath.Join(tmpPath, "chunk_*")
@@ -852,7 +863,7 @@ func findAndValidateChunks(uploadID string, totalChunks int) ([]string, []int, e
 		return nil, nil, fmt.Errorf("no chunk files found")
 	}
 
-	// Parse and validate chunk indices
+	// 解析和验证分片索引
 	indices := make(map[int]string)
 	for _, file := range files {
 		base := filepath.Base(file)
@@ -869,7 +880,7 @@ func findAndValidateChunks(uploadID string, totalChunks int) ([]string, []int, e
 
 		index, err := strconv.Atoi(idxStr)
 		if err != nil {
-			// Try parsing without trimming zeros
+			// 尝试不修剪零的解析
 			index, err = strconv.Atoi(strings.TrimPrefix(base, "chunk_"))
 			if err != nil {
 				log.Printf("Parse chunk index failed for %s: %v\n", file, err)
@@ -879,7 +890,7 @@ func findAndValidateChunks(uploadID string, totalChunks int) ([]string, []int, e
 		indices[index] = file
 	}
 
-	// Check for missing chunks
+	// 检查缺失的分片
 	var missing []int
 	for i := 0; i < totalChunks; i++ {
 		if _, exists := indices[i]; !exists {
@@ -887,7 +898,7 @@ func findAndValidateChunks(uploadID string, totalChunks int) ([]string, []int, e
 		}
 	}
 
-	// Sort files by index
+	// 按索引排序文件
 	var sortedFiles []string
 	for i := 0; i < totalChunks; i++ {
 		if file, exists := indices[i]; exists {
@@ -898,7 +909,9 @@ func findAndValidateChunks(uploadID string, totalChunks int) ([]string, []int, e
 	return sortedFiles, missing, nil
 }
 
+// mergeChunks 合并分片
 func mergeChunks(uploadID, fileName string, chunkFiles []string) (string, int64, string, error) {
+	// 构建最终文件路径
 	finalPath := filepath.Join(finalDir, fmt.Sprintf("%s_%s", uploadID, filepath.Base(fileName)))
 	_ = os.MkdirAll(finalDir, 0755)
 	
@@ -912,6 +925,7 @@ func mergeChunks(uploadID, fileName string, chunkFiles []string) (string, int64,
 	hasher := md5.New()
 	totalWritten := int64(0)
 
+	// 按顺序合并所有分片
 	for i, chunkFile := range chunkFiles {
 		f, err := os.Open(chunkFile)
 		if err != nil {
@@ -926,7 +940,7 @@ func mergeChunks(uploadID, fileName string, chunkFiles []string) (string, int64,
 
 		totalWritten += n
 
-		// Log progress for large files
+		// 为大文件记录进度
 		if i%50 == 0 {
 			log.Printf("Merging upload %s: chunk %d/%d, written %d bytes\n", 
 				uploadID, i+1, len(chunkFiles), totalWritten)
@@ -937,7 +951,7 @@ func mergeChunks(uploadID, fileName string, chunkFiles []string) (string, int64,
 		return "", 0, "", err
 	}
 
-	// Rename to final path
+	// 重命名为最终路径
 	if err := os.Rename(tmpFinalPath, finalPath); err != nil {
 		return "", 0, "", err
 	}
@@ -946,6 +960,7 @@ func mergeChunks(uploadID, fileName string, chunkFiles []string) (string, int64,
 	return finalPath, totalWritten, fileMD5, nil
 }
 
+// cleanupChunks 清理临时分片
 func cleanupChunks(uploadID string) {
 	tmpPath := filepath.Join(tmpDir, uploadID)
 	if err := os.RemoveAll(tmpPath); err != nil {
@@ -966,61 +981,59 @@ func HealthCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, healthInfo)
 }
 
+// main 主函数
 func main() {
-	// Ensure directories exist
+	// 确保目录存在
 	_ = os.MkdirAll(tmpDir, 0755)
 	_ = os.MkdirAll(finalDir, 0755)
 
-	// Connect to database
+	// 连接数据库
 	dsn := "root:root@tcp(127.0.0.1:3306)/filedb?parseTime=true"
 	if err := initDB(dsn); err != nil {
 		log.Fatal("Database initialization failed:", err)
 	}
 
-	// Initialize router
+	// 初始化路由器
 	r := mux.NewRouter()
 
-	// API routes
+	// API路由
 	api := r.PathPrefix("/api/v1").Subrouter()
 	
-	// Upload routes
+	// 上传路由
 	uploads := api.PathPrefix("/uploads").Subrouter()
 	uploads.HandleFunc("", CreateUpload).Methods("POST")
 	uploads.HandleFunc("/{upload_id}", GetUploadStatus).Methods("GET")
 	uploads.HandleFunc("/{upload_id}/complete", CompleteUpload).Methods("POST")
 	uploads.HandleFunc("/{upload_id}/chunks/{index}", UploadChunk).Methods("PUT", "POST")
 
-	// File history routes
+	// 文件历史路由
 	files := api.PathPrefix("/files").Subrouter()
 	files.HandleFunc("/history", GetFileHistory).Methods("GET")
 
-
-
-// 新增统计路由
+	// 新增统计路由
 	files.HandleFunc("/stats", GetFileStats).Methods("GET")
 	files.HandleFunc("/today-stats", GetTodayUploadStats).Methods("GET")
 	files.HandleFunc("/recent", GetRecentFiles).Methods("GET")
 
-
-	// System routes
+	// 系统路由
 	api.HandleFunc("/health", HealthCheck).Methods("GET")
 
-		files.HandleFunc("/{upload_id}", GetFileDetail).Methods("GET")
+	files.HandleFunc("/{upload_id}", GetFileDetail).Methods("GET")
 
-	// Configure CORS
+	// 配置CORS
 	c := cors.New(cors.Options{
-		AllowedOrigins:   []string{"*"},
+		AllowedOrigins:   []string{"*"}, // 允许所有源
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"*"},
 		AllowCredentials: true,
-		MaxAge:           86400,
+		MaxAge:           86400, // 预检请求缓存时间
 	})
 
-	// Start server
+	// 启动服务器
 	srv := &http.Server{
 		Addr:         ":8080",
 		Handler:      c.Handler(r),
-		ReadTimeout:  30 * time.Minute,
+		ReadTimeout:  30 * time.Minute, // 长超时以适应大文件上传
 		WriteTimeout: 30 * time.Minute,
 	}
 
@@ -1035,7 +1048,6 @@ func main() {
 	log.Println("  GET    /api/v1/files/stats")           // 新增
 	log.Println("  GET    /api/v1/files/today-stats")     // 新增
 	log.Println("  GET    /api/v1/files/recent")          // 新增
-	log.Println("  GET    /api/v1/health")
 	log.Println("  GET    /api/v1/health")
 
 	log.Fatal(srv.ListenAndServe())
