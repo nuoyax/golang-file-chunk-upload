@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,7 +20,6 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
-
 	"github.com/rs/cors"
 )
 
@@ -33,7 +31,66 @@ var (
 	uploadLocksMu sync.Mutex
 )
 
-// helper to get per-upload mutex (single-instance safe)
+// Request/Response Models
+type (
+	// UploadRequest 创建上传任务请求
+	UploadRequest struct {
+		FileName  string `json:"file_name" binding:"required"`
+		TotalSize int64  `json:"total_size" binding:"required,min=1"`
+		ChunkSize int    `json:"chunk_size" binding:"required,min=1"`
+		MD5       string `json:"md5,omitempty"`
+	}
+
+	// UploadResponse 创建上传任务响应
+	UploadResponse struct {
+		UploadID    string `json:"upload_id"`
+		ChunkSize   int    `json:"chunk_size"`
+		TotalChunks int    `json:"total_chunks"`
+	}
+
+	// ChunkUploadResponse 分片上传响应
+	ChunkUploadResponse struct {
+		Index int    `json:"index"`
+		Size  int64  `json:"size"`
+		MD5   string `json:"md5"`
+	}
+
+	// UploadStatusResponse 上传状态响应
+	UploadStatusResponse struct {
+		UploadID string `json:"upload_id"`
+		Status   string `json:"status"`
+		Chunks   []int  `json:"chunks"`
+		Progress struct {
+			Completed int `json:"completed"`
+			Total     int `json:"total"`
+			Percent   int `json:"percent"`
+		} `json:"progress"`
+	}
+
+	// CompleteResponse 完成上传响应
+	CompleteResponse struct {
+		Status    string `json:"status"`
+		FinalPath string `json:"final_path"`
+		FileSize  int64  `json:"file_size"`
+		MD5       string `json:"md5,omitempty"`
+	}
+
+	// ErrorResponse 错误响应
+	ErrorResponse struct {
+		Error   string `json:"error"`
+		Code    int    `json:"code"`
+		Message string `json:"message,omitempty"`
+	}
+)
+
+// Constants
+const (
+	StatusInProgress = "in_progress"
+	StatusCompleted  = "completed"
+	StatusFailed     = "failed"
+)
+
+// Helper functions
 func getUploadLock(uploadID string) *sync.Mutex {
 	uploadLocksMu.Lock()
 	defer uploadLocksMu.Unlock()
@@ -45,20 +102,21 @@ func getUploadLock(uploadID string) *sync.Mutex {
 	return m
 }
 
-type InitRequest struct {
-	FileName  string `json:"file_name"`
-	TotalSize int64  `json:"total_size"`
-	ChunkSize int    `json:"chunk_size"`
-	// optional client-provided overall checksum
-	MD5 string `json:"md5,omitempty"`
+func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
 }
 
-type InitResponse struct {
-	UploadID    string `json:"upload_id"`
-	ChunkSize   int    `json:"chunk_size"`
-	TotalChunks int    `json:"total_chunks"`
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, ErrorResponse{
+		Error:   http.StatusText(status),
+		Code:    status,
+		Message: message,
+	})
 }
 
+// Database initialization
 func initDB(dsn string) error {
 	var err error
 	db, err = sql.Open("mysql", dsn)
@@ -71,379 +129,453 @@ func initDB(dsn string) error {
 	return db.Ping()
 }
 
-// POST /upload/init
-func handleInit(w http.ResponseWriter, r *http.Request) {
-	var req InitRequest
+// Handlers
+
+// CreateUpload 创建上传任务
+// POST /api/v1/uploads
+func CreateUpload(w http.ResponseWriter, r *http.Request) {
+	var req UploadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid body", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
+
 	if req.FileName == "" || req.TotalSize <= 0 || req.ChunkSize <= 0 {
-		http.Error(w, "missing fields", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "Missing or invalid required fields: file_name, total_size, chunk_size")
 		return
 	}
+
 	totalChunks := int((req.TotalSize + int64(req.ChunkSize) - 1) / int64(req.ChunkSize))
 	uploadID := uuid.New().String()
 
 	_, err := db.Exec(
-		"INSERT INTO uploads (upload_id, file_name, total_size, chunk_size, total_chunks, status) VALUES (?, ?, ?, ?, ?, 'in_progress')",
-		uploadID, req.FileName, req.TotalSize, req.ChunkSize, totalChunks,
+		"INSERT INTO uploads (upload_id, file_name, total_size, chunk_size, total_chunks, status) VALUES (?, ?, ?, ?, ?, ?)",
+		uploadID, req.FileName, req.TotalSize, req.ChunkSize, totalChunks, StatusInProgress,
 	)
 	if err != nil {
-		log.Println("db insert upload error:", err)
-		http.Error(w, "db error", http.StatusInternalServerError)
+		log.Println("Database insert upload error:", err)
+		writeError(w, http.StatusInternalServerError, "Failed to create upload task")
 		return
 	}
 
-	// create tmp dir
+	// Create temporary directory for chunks
 	_ = os.MkdirAll(filepath.Join(tmpDir, uploadID), 0755)
 
-	resp := InitResponse{
+	resp := UploadResponse{
 		UploadID:    uploadID,
 		ChunkSize:   req.ChunkSize,
 		TotalChunks: totalChunks,
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusCreated, resp)
 }
 
-// PUT /upload/{upload_id}/chunk?index=0
-// form-data: file (binary) OR raw body
-func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
+// UploadChunk 上传文件分片
+// PUT /api/v1/uploads/{upload_id}/chunks/{index}
+func UploadChunk(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	uploadID := vars["upload_id"]
-	indexStr := r.URL.Query().Get("index")
-	if indexStr == "" {
-		http.Error(w, "index required", http.StatusBadRequest)
-		return
-	}
+	indexStr := vars["index"]
+
 	index, err := strconv.Atoi(indexStr)
 	if err != nil || index < 0 {
-		http.Error(w, "invalid index", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "Invalid chunk index")
 		return
 	}
 
-	// get upload info
-	var chunkSize int
-	var totalChunks int
-	err = db.QueryRow("SELECT chunk_size, total_chunks FROM uploads WHERE upload_id = ?", uploadID).Scan(&chunkSize, &totalChunks)
+	// Get upload info
+	var chunkSize, totalChunks int
+	var status string
+	err = db.QueryRow(
+		"SELECT chunk_size, total_chunks, status FROM uploads WHERE upload_id = ?",
+		uploadID,
+	).Scan(&chunkSize, &totalChunks, &status)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			http.Error(w, "upload_id not found", http.StatusNotFound)
+			writeError(w, http.StatusNotFound, "Upload task not found")
 			return
 		}
-		log.Println("db query:", err)
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-	if index >= totalChunks {
-		http.Error(w, "index out of range", http.StatusBadRequest)
+		log.Println("Database query error:", err)
+		writeError(w, http.StatusInternalServerError, "Database error")
 		return
 	}
 
-	// read body into temp file
+	if status != StatusInProgress {
+		writeError(w, http.StatusBadRequest, "Upload is not in progress")
+		return
+	}
+
+	if index >= totalChunks {
+		writeError(w, http.StatusBadRequest, "Chunk index out of range")
+		return
+	}
+
+	// Create temporary directory
 	tmpPath := filepath.Join(tmpDir, uploadID)
 	_ = os.MkdirAll(tmpPath, 0755)
 	chunkPath := filepath.Join(tmpPath, fmt.Sprintf("chunk_%06d", index))
+
+	// Create temporary file
 	tmpFile, err := os.Create(chunkPath + ".part")
 	if err != nil {
-		log.Println("create chunk file:", err)
-		http.Error(w, "server error", http.StatusInternalServerError)
+		log.Println("Create chunk file error:", err)
+		writeError(w, http.StatusInternalServerError, "Server error")
 		return
 	}
 	defer tmpFile.Close()
 
-	// read request body
+	// Read and write chunk data with MD5 calculation
 	hasher := md5.New()
 	mw := io.MultiWriter(tmpFile, hasher)
 	n, err := io.Copy(mw, r.Body)
 	if err != nil {
-		log.Println("write chunk:", err)
-		http.Error(w, "write error", http.StatusInternalServerError)
+		log.Println("Write chunk error:", err)
+		writeError(w, http.StatusInternalServerError, "Write error")
 		return
 	}
-	_ = tmpFile.Close()
+	tmpFile.Close()
 
 	chunkMD5 := hex.EncodeToString(hasher.Sum(nil))
 
-	// atomically rename
+	// Atomically rename temporary file
 	if err := os.Rename(chunkPath+".part", chunkPath); err != nil {
-		log.Println("rename:", err)
-		http.Error(w, "server error", http.StatusInternalServerError)
+		log.Println("Rename chunk file error:", err)
+		writeError(w, http.StatusInternalServerError, "Server error")
 		return
 	}
 
-	// insert or replace chunk record
+	// Save chunk metadata to database
 	_, err = db.Exec(`
 		INSERT INTO upload_chunks (upload_id, chunk_index, chunk_size, chunk_md5)
 		VALUES (?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE chunk_size = VALUES(chunk_size), chunk_md5 = VALUES(chunk_md5), received_at = CURRENT_TIMESTAMP
+		ON DUPLICATE KEY UPDATE 
+			chunk_size = VALUES(chunk_size), 
+			chunk_md5 = VALUES(chunk_md5), 
+			received_at = CURRENT_TIMESTAMP
 	`, uploadID, index, n, chunkMD5)
 	if err != nil {
-		log.Println("db insert chunk:", err)
-		http.Error(w, "db error", http.StatusInternalServerError)
+		log.Println("Database insert chunk error:", err)
+		writeError(w, http.StatusInternalServerError, "Database error")
 		return
 	}
 
-	w.WriteHeader(http.StatusCreated)
-	fmt.Fprintf(w, `{"index":%d,"size":%d,"md5":"%s"}`, index, n, chunkMD5)
+	resp := ChunkUploadResponse{
+		Index: index,
+		Size:  n,
+		MD5:   chunkMD5,
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
-// GET /upload/{upload_id}/status
-// returns uploaded chunk indices
-func handleStatus(w http.ResponseWriter, r *http.Request) {
+// GetUploadStatus 获取上传状态
+// GET /api/v1/uploads/{upload_id}
+func GetUploadStatus(w http.ResponseWriter, r *http.Request) {
 	uploadID := mux.Vars(r)["upload_id"]
-	rows, err := db.Query("SELECT chunk_index FROM upload_chunks WHERE upload_id = ?", uploadID)
+
+	// Get upload basic info
+	var fileName string
+	var totalSize int64
+	var chunkSize, totalChunks int
+	var status string
+	err := db.QueryRow(
+		"SELECT file_name, total_size, chunk_size, total_chunks, status FROM uploads WHERE upload_id = ?",
+		uploadID,
+	).Scan(&fileName, &totalSize, &chunkSize, &totalChunks, &status)
 	if err != nil {
-		log.Println("db query chunks:", err)
-		http.Error(w, "db error", http.StatusInternalServerError)
+		if err == sql.ErrNoRows {
+			writeError(w, http.StatusNotFound, "Upload task not found")
+			return
+		}
+		log.Println("Database query error:", err)
+		writeError(w, http.StatusInternalServerError, "Database error")
+		return
+	}
+
+	// Get uploaded chunks
+	rows, err := db.Query("SELECT chunk_index FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index", uploadID)
+	if err != nil {
+		log.Println("Database query chunks error:", err)
+		writeError(w, http.StatusInternalServerError, "Database error")
 		return
 	}
 	defer rows.Close()
-	var indices []int
+
+	var chunks []int
 	for rows.Next() {
 		var idx int
 		rows.Scan(&idx)
-		indices = append(indices, idx)
+		chunks = append(chunks, idx)
 	}
-	resp := map[string]interface{}{
-		"upload_id": uploadID,
-		"chunks":    indices,
+
+	// Build response
+	resp := UploadStatusResponse{
+		UploadID: uploadID,
+		Status:   status,
+		Chunks:   chunks,
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	resp.Progress.Completed = len(chunks)
+	resp.Progress.Total = totalChunks
+	if totalChunks > 0 {
+		resp.Progress.Percent = int(float64(len(chunks)) / float64(totalChunks) * 100)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
-// POST /upload/{upload_id}/complete
-// 替换整个 handleComplete 实现
-func handleComplete(w http.ResponseWriter, r *http.Request) {
+// CompleteUpload 完成上传
+// POST /api/v1/uploads/{upload_id}/complete
+func CompleteUpload(w http.ResponseWriter, r *http.Request) {
 	uploadID := mux.Vars(r)["upload_id"]
 	lock := getUploadLock(uploadID)
 	lock.Lock()
 	defer lock.Unlock()
 
-	// fetch upload metadata
+	// Fetch upload metadata
 	var fileName string
 	var totalSize int64
-	var chunkSize int
-	var totalChunks int
+	var chunkSize, totalChunks int
 	var status string
-	err := db.QueryRow("SELECT file_name, total_size, chunk_size, total_chunks, status FROM uploads WHERE upload_id = ?", uploadID).
-		Scan(&fileName, &totalSize, &chunkSize, &totalChunks, &status)
+	err := db.QueryRow(
+		"SELECT file_name, total_size, chunk_size, total_chunks, status FROM uploads WHERE upload_id = ?",
+		uploadID,
+	).Scan(&fileName, &totalSize, &chunkSize, &totalChunks, &status)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			http.Error(w, "not found", http.StatusNotFound)
+			writeError(w, http.StatusNotFound, "Upload task not found")
 			return
 		}
-		log.Println("db read upload:", err)
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-	if status == "completed" {
-		http.Error(w, "already completed", http.StatusBadRequest)
+		log.Println("Database read upload error:", err)
+		writeError(w, http.StatusInternalServerError, "Database error")
 		return
 	}
 
-	// tmp path where chunks are stored
+	if status == StatusCompleted {
+		writeError(w, http.StatusBadRequest, "Upload already completed")
+		return
+	}
+
+	// Find and validate chunks
+	chunkFiles, missing, err := findAndValidateChunks(uploadID, totalChunks)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if len(missing) > 0 {
+		msg := fmt.Sprintf("Missing chunks: %v (found %d, expected %d)", missing, len(chunkFiles), totalChunks)
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+
+	// Merge chunks
+	finalPath, fileSize, fileMD5, err := mergeChunks(uploadID, fileName, chunkFiles)
+	if err != nil {
+		log.Println("Merge chunks error:", err)
+		writeError(w, http.StatusInternalServerError, "Failed to merge chunks")
+		return
+	}
+
+	// Update database status
+	_, err = db.Exec(
+		"UPDATE uploads SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE upload_id = ?",
+		StatusCompleted, uploadID,
+	)
+	if err != nil {
+		log.Println("Database update upload error:", err)
+		// Non-fatal: don't affect client response
+	}
+
+	// Async cleanup
+	go cleanupChunks(uploadID)
+
+	log.Printf("Upload %s completed successfully -> %s (size: %d bytes)\n", uploadID, finalPath, fileSize)
+
+	resp := CompleteResponse{
+		Status:    StatusCompleted,
+		FinalPath: finalPath,
+		FileSize:  fileSize,
+		MD5:       fileMD5,
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// Helper functions for CompleteUpload
+func findAndValidateChunks(uploadID string, totalChunks int) ([]string, []int, error) {
 	tmpPath := filepath.Join(tmpDir, uploadID)
-	// list chunk files on disk
 	pattern := filepath.Join(tmpPath, "chunk_*")
 	files, err := filepath.Glob(pattern)
 	if err != nil {
-		log.Println("glob chunks error:", err)
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
-	}
-	if len(files) == 0 {
-		log.Printf("no chunk files found for uploadID=%s under %s\n", uploadID, tmpPath)
-		http.Error(w, "no chunks found", http.StatusBadRequest)
-		return
+		return nil, nil, fmt.Errorf("glob chunks error: %v", err)
 	}
 
-	// parse indices and sort
-	type part struct {
-		path  string
-		index int
+	if len(files) == 0 {
+		return nil, nil, fmt.Errorf("no chunk files found")
 	}
-	parts := make([]part, 0, len(files))
-	for _, p := range files {
-		base := filepath.Base(p) // chunk_000000
-		// 支持你的命名格式 "chunk_%06d"
-		// 去掉前缀 "chunk_"
+
+	// Parse and validate chunk indices
+	indices := make(map[int]string)
+	for _, file := range files {
+		base := filepath.Base(file)
 		if !strings.HasPrefix(base, "chunk_") {
 			continue
 		}
+
 		idxStr := strings.TrimPrefix(base, "chunk_")
-		// 如果你以前是没有零填充的（如 chunk_0），下面仍能解析
 		idxStr = strings.TrimLeft(idxStr, "0")
 		if idxStr == "" {
-			// 全零的情况 -> index 0
-			parts = append(parts, part{path: p, index: 0})
+			indices[0] = file
 			continue
 		}
-		i, err := strconv.Atoi(idxStr)
+
+		index, err := strconv.Atoi(idxStr)
 		if err != nil {
-			// 兼容：如果文件名没有去掉前导 0 导致解析出错，尝试按全部字符串解析
-			i, err = strconv.Atoi(strings.TrimPrefix(filepath.Base(p), "chunk_"))
+			// Try parsing without trimming zeros
+			index, err = strconv.Atoi(strings.TrimPrefix(base, "chunk_"))
 			if err != nil {
-				log.Println("parse chunk index failed for", p, "err:", err)
+				log.Printf("Parse chunk index failed for %s: %v\n", file, err)
 				continue
 			}
 		}
-		parts = append(parts, part{path: p, index: i})
+		indices[index] = file
 	}
 
-	if len(parts) == 0 {
-		log.Printf("no parsable chunk files for uploadID=%s\n", uploadID)
-		http.Error(w, "no valid chunks found", http.StatusBadRequest)
-		return
-	}
-
-	// sort by index
-	sort.Slice(parts, func(i, j int) bool { return parts[i].index < parts[j].index })
-
-	// detect missing indices (based on expected totalChunks from DB)
-	missing := []int{}
-	seen := make(map[int]bool, len(parts))
-	for _, p := range parts {
-		seen[p.index] = true
-	}
+	// Check for missing chunks
+	var missing []int
 	for i := 0; i < totalChunks; i++ {
-		if !seen[i] {
+		if _, exists := indices[i]; !exists {
 			missing = append(missing, i)
 		}
 	}
-	if len(missing) > 0 {
-		msg := fmt.Sprintf("missing chunks: %v (found %d on disk, expected %d)", missing, len(parts), totalChunks)
-		log.Printf("uploadID=%s: %s\n", uploadID, msg)
-		http.Error(w, msg, http.StatusBadRequest)
-		return
+
+	// Sort files by index
+	var sortedFiles []string
+	for i := 0; i < totalChunks; i++ {
+		if file, exists := indices[i]; exists {
+			sortedFiles = append(sortedFiles, file)
+		}
 	}
 
-	// assemble to final file (.part -> rename)
+	return sortedFiles, missing, nil
+}
+
+func mergeChunks(uploadID, fileName string, chunkFiles []string) (string, int64, string, error) {
 	finalPath := filepath.Join(finalDir, fmt.Sprintf("%s_%s", uploadID, filepath.Base(fileName)))
 	_ = os.MkdirAll(finalDir, 0755)
-	outPathTmp := finalPath + ".part"
-	out, err := os.Create(outPathTmp)
+	
+	tmpFinalPath := finalPath + ".part"
+	out, err := os.Create(tmpFinalPath)
 	if err != nil {
-		log.Println("create final file:", err)
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
+		return "", 0, "", err
 	}
+	defer out.Close()
 
-	// merge
 	hasher := md5.New()
 	totalWritten := int64(0)
-	for _, p := range parts {
-		f, err := os.Open(p.path)
+
+	for i, chunkFile := range chunkFiles {
+		f, err := os.Open(chunkFile)
 		if err != nil {
-			log.Println("open chunk:", p.path, err)
-			out.Close()
-			os.Remove(outPathTmp)
-			http.Error(w, fmt.Sprintf("open chunk %d failed: %v", p.index, err), http.StatusInternalServerError)
-			return
+			return "", 0, "", fmt.Errorf("open chunk %s: %v", chunkFile, err)
 		}
+
 		n, err := io.Copy(io.MultiWriter(out, hasher), f)
 		f.Close()
 		if err != nil {
-			log.Println("copy chunk:", p.path, err)
-			out.Close()
-			os.Remove(outPathTmp)
-			http.Error(w, fmt.Sprintf("read chunk %d failed: %v", p.index, err), http.StatusInternalServerError)
-			return
+			return "", 0, "", fmt.Errorf("copy chunk %s: %v", chunkFile, err)
 		}
+
 		totalWritten += n
-		// optional: log progress occasionally
-		if p.index%50 == 0 {
-			log.Printf("merging uploadID=%s chunk=%d written=%d\n", uploadID, p.index, totalWritten)
+
+		// Log progress for large files
+		if i%50 == 0 {
+			log.Printf("Merging upload %s: chunk %d/%d, written %d bytes\n", 
+				uploadID, i+1, len(chunkFiles), totalWritten)
 		}
 	}
 
-	// close final output
 	if err := out.Close(); err != nil {
-		log.Println("close final file error:", err)
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
+		return "", 0, "", err
 	}
 
-	// size check
-	fi, err := os.Stat(outPathTmp)
-	if err == nil {
-		if fi.Size() != totalSize {
-			log.Printf("warning: assembled size %d != expected %d for uploadID=%s\n", fi.Size(), totalSize, uploadID)
-			// 这里不强制失败，仅做警告（你可按需改为失败）
-		}
+	// Rename to final path
+	if err := os.Rename(tmpFinalPath, finalPath); err != nil {
+		return "", 0, "", err
 	}
 
-	// rename
-	if err := os.Rename(outPathTmp, finalPath); err != nil {
-		log.Println("rename final:", err)
-		http.Error(w, "server error", http.StatusInternalServerError)
-		return
-	}
-
-	// update DB status
-	_, err = db.Exec("UPDATE uploads SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE upload_id = ?", uploadID)
-	if err != nil {
-		log.Println("db update upload:", err)
-		// 非致命：不影响客户端成功返回
-	}
-
-	// async cleanup chunks
-	go func() {
-		_ = os.RemoveAll(tmpPath)
-	}()
-
-	log.Printf("uploadID=%s merged successfully -> %s (total %d bytes)\n", uploadID, finalPath, totalWritten)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":     "completed",
-		"final_path": finalPath,
-	})
+	fileMD5 := hex.EncodeToString(hasher.Sum(nil))
+	return finalPath, totalWritten, fileMD5, nil
 }
 
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(200)
-	w.Write([]byte("OK"))
+func cleanupChunks(uploadID string) {
+	tmpPath := filepath.Join(tmpDir, uploadID)
+	if err := os.RemoveAll(tmpPath); err != nil {
+		log.Printf("Cleanup chunks error for %s: %v\n", uploadID, err)
+	} else {
+		log.Printf("Cleaned up chunks for upload %s\n", uploadID)
+	}
+}
+
+// HealthCheck 健康检查
+// GET /api/v1/health
+func HealthCheck(w http.ResponseWriter, r *http.Request) {
+	healthInfo := map[string]interface{}{
+		"status":    "healthy",
+		"timestamp": time.Now().UTC(),
+		"version":   "1.0.0",
+	}
+	writeJSON(w, http.StatusOK, healthInfo)
 }
 
 func main() {
-	// ensure dirs
+	// Ensure directories exist
 	_ = os.MkdirAll(tmpDir, 0755)
 	_ = os.MkdirAll(finalDir, 0755)
 
-	// connect DB (replace with your DSN)
+	// Connect to database
 	dsn := "root:root@tcp(127.0.0.1:3306)/filedb?parseTime=true"
 	if err := initDB(dsn); err != nil {
-		log.Fatal("db init failed:", err)
+		log.Fatal("Database initialization failed:", err)
 	}
 
+	// Initialize router
 	r := mux.NewRouter()
-	r.HandleFunc("/health", handleHealth).Methods("GET")
-	r.HandleFunc("/upload/init", handleInit).Methods("POST")
-	r.HandleFunc("/upload/{upload_id}/chunk", handleUploadChunk).Methods("PUT", "POST")
-	r.HandleFunc("/upload/{upload_id}/status", handleStatus).Methods("GET")
-	r.HandleFunc("/upload/{upload_id}/complete", handleComplete).Methods("POST")
 
-	// 配置 CORS
+	// API routes
+	api := r.PathPrefix("/api/v1").Subrouter()
+	
+	// Upload routes
+	uploads := api.PathPrefix("/uploads").Subrouter()
+	uploads.HandleFunc("", CreateUpload).Methods("POST")
+	uploads.HandleFunc("/{upload_id}", GetUploadStatus).Methods("GET")
+	uploads.HandleFunc("/{upload_id}/complete", CompleteUpload).Methods("POST")
+	uploads.HandleFunc("/{upload_id}/chunks/{index}", UploadChunk).Methods("PUT", "POST")
+
+	// System routes
+	api.HandleFunc("/health", HealthCheck).Methods("GET")
+
+	// Configure CORS
 	c := cors.New(cors.Options{
-		AllowedOrigins: []string{"*"}, // 生产环境应该指定具体域名
-		AllowedMethods: []string{"GET", "POST", "PUT", "OPTIONS"},
-		AllowedHeaders: []string{"*"},
-		MaxAge:         86400,
+		AllowedOrigins:   []string{"*"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"*"},
+		AllowCredentials: true,
+		MaxAge:           86400,
 	})
 
-	// 使用 CORS 中间件包装路由
-	handler := c.Handler(r)
-
-
+	// Start server
 	srv := &http.Server{
 		Addr:         ":8080",
-		Handler:      handler,
+		Handler:      c.Handler(r),
 		ReadTimeout:  30 * time.Minute,
 		WriteTimeout: 30 * time.Minute,
 	}
-	log.Println("listening :8080")
+
+	log.Println("Server starting on :8080")
+	log.Println("Available endpoints:")
+	log.Println("  POST   /api/v1/uploads")
+	log.Println("  GET    /api/v1/uploads/{upload_id}")
+	log.Println("  POST   /api/v1/uploads/{upload_id}/complete")
+	log.Println("  PUT    /api/v1/uploads/{upload_id}/chunks/{index}")
+	log.Println("  GET    /api/v1/health")
+
 	log.Fatal(srv.ListenAndServe())
 }
