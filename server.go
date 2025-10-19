@@ -21,6 +21,8 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
+
+	"github.com/rs/cors"
 )
 
 var (
@@ -424,9 +426,21 @@ func main() {
 	r.HandleFunc("/upload/{upload_id}/status", handleStatus).Methods("GET")
 	r.HandleFunc("/upload/{upload_id}/complete", handleComplete).Methods("POST")
 
+	// 配置 CORS
+	c := cors.New(cors.Options{
+		AllowedOrigins: []string{"*"}, // 生产环境应该指定具体域名
+		AllowedMethods: []string{"GET", "POST", "PUT", "OPTIONS"},
+		AllowedHeaders: []string{"*"},
+		MaxAge:         86400,
+	})
+
+	// 使用 CORS 中间件包装路由
+	handler := c.Handler(r)
+
+
 	srv := &http.Server{
 		Addr:         ":8080",
-		Handler:      r,
+		Handler:      handler,
 		ReadTimeout:  30 * time.Minute,
 		WriteTimeout: 30 * time.Minute,
 	}
