@@ -35,7 +35,7 @@
 
 
 ## 效果截图
-<img src="./img/20251019.png" width="50%" alt="TypeScript">
+<img src="./img/20251019.png" width="80%" alt="TypeScript">
 
 
 ## 目录结构
