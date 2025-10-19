@@ -112,7 +112,41 @@ type (
 		SortBy  string `json:"sort_by"`
 		Order   string `json:"order"`
 	}
+
+	// FileStatsResponse 文件统计响应
+	FileStatsResponse struct {
+		TotalCount       int64   `json:"total_count"`
+		CompletedCount   int64   `json:"completed_count"`
+		TotalSize        int64   `json:"total_size"`
+		TodayUploadCount int64   `json:"today_upload_count"`
+		SuccessRate      float64 `json:"success_rate"`
+		AverageFileSize  float64 `json:"average_file_size"`
+	}
+
+	// TodayUploadStatsResponse 今日上传统计响应
+	TodayUploadStatsResponse struct {
+		Count     int64 `json:"count"`
+		TotalSize int64 `json:"total_size"`
+	}
+
+	// RecentFile 最近上传的文件
+	RecentFile struct {
+		UploadID   string    `json:"upload_id"`
+		FileName   string    `json:"file_name"`
+		FileSize   int64     `json:"file_size"`
+		Status     string    `json:"status"`
+		CreatedAt  time.Time `json:"created_at"`
+		UpdatedAt  time.Time `json:"updated_at"`
+	}
+
+	// RecentFilesResponse 最近文件响应
+	RecentFilesResponse struct {
+		Files []*RecentFile `json:"files"`
+	}
 )
+
+
+
 
 // Constants
 const (
@@ -124,6 +158,155 @@ const (
 	DefaultPerPage = 20
 	MaxPerPage     = 100
 )
+
+
+// GetFileStats 获取文件统计信息
+// GET /api/v1/files/stats
+func GetFileStats(w http.ResponseWriter, r *http.Request) {
+	var stats FileStatsResponse
+
+	// 获取总文件数
+	err := db.QueryRow("SELECT COUNT(*) FROM uploads").Scan(&stats.TotalCount)
+	if err != nil {
+		log.Printf("Get total count error: %v", err)
+		writeError(w, http.StatusInternalServerError, "获取总文件数失败")
+		return
+	}
+
+	// 获取已完成文件数
+	err = db.QueryRow("SELECT COUNT(*) FROM uploads WHERE status = ?", StatusCompleted).Scan(&stats.CompletedCount)
+	if err != nil {
+		log.Printf("Get completed count error: %v", err)
+		writeError(w, http.StatusInternalServerError, "获取已完成文件数失败")
+		return
+	}
+
+	// 获取总文件大小
+	err = db.QueryRow("SELECT COALESCE(SUM(total_size), 0) FROM uploads WHERE status = ?", StatusCompleted).Scan(&stats.TotalSize)
+	if err != nil {
+		log.Printf("Get total size error: %v", err)
+		writeError(w, http.StatusInternalServerError, "获取总文件大小失败")
+		return
+	}
+
+	// 获取今日上传数量
+	today := time.Now().Format("2006-01-02")
+	err = db.QueryRow("SELECT COUNT(*) FROM uploads WHERE DATE(created_at) = ?", today).Scan(&stats.TodayUploadCount)
+	if err != nil {
+		log.Printf("Get today count error: %v", err)
+		writeError(w, http.StatusInternalServerError, "获取今日上传数量失败")
+		return
+	}
+
+	// 计算成功率
+	if stats.TotalCount > 0 {
+		stats.SuccessRate = float64(stats.CompletedCount) / float64(stats.TotalCount) * 100
+	} else {
+		stats.SuccessRate = 0
+	}
+
+	// 计算平均文件大小
+	if stats.CompletedCount > 0 {
+		stats.AverageFileSize = float64(stats.TotalSize) / float64(stats.CompletedCount)
+	} else {
+		stats.AverageFileSize = 0
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"data": stats,
+	})
+}
+
+// GetTodayUploadStats 获取今日上传统计
+// GET /api/v1/files/today-stats
+func GetTodayUploadStats(w http.ResponseWriter, r *http.Request) {
+	var stats TodayUploadStatsResponse
+
+	// 获取今日上传的文件数量和总大小
+	today := time.Now().Format("2006-01-02")
+	query := `
+		SELECT 
+			COUNT(*) as count,
+			COALESCE(SUM(total_size), 0) as total_size
+		FROM uploads 
+		WHERE DATE(created_at) = ? AND status = ?
+	`
+
+	err := db.QueryRow(query, today, StatusCompleted).Scan(&stats.Count, &stats.TotalSize)
+	if err != nil {
+		log.Printf("Get today stats error: %v", err)
+		writeError(w, http.StatusInternalServerError, "获取今日上传统计失败")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"data": stats,
+	})
+}
+
+// GetRecentFiles 获取最近上传的文件
+// GET /api/v1/files/recent
+func GetRecentFiles(w http.ResponseWriter, r *http.Request) {
+	// 获取查询参数
+	limitStr := r.URL.Query().Get("limit")
+	limit := 5 // 默认值
+
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			if l > 50 {
+				l = 50 // 限制最大数量
+			}
+			limit = l
+		}
+	}
+
+	// 查询最近的文件
+	query := `
+		SELECT 
+			upload_id, file_name, total_size, status, created_at, updated_at
+		FROM uploads 
+		ORDER BY created_at DESC 
+		LIMIT ?
+	`
+
+	rows, err := db.Query(query, limit)
+	if err != nil {
+		log.Printf("Get recent files error: %v", err)
+		writeError(w, http.StatusInternalServerError, "获取最近文件失败")
+		return
+	}
+	defer rows.Close()
+
+	var files []*RecentFile
+	for rows.Next() {
+		file := &RecentFile{}
+		err := rows.Scan(
+			&file.UploadID,
+			&file.FileName,
+			&file.FileSize,
+			&file.Status,
+			&file.CreatedAt,
+			&file.UpdatedAt,
+		)
+		if err != nil {
+			log.Printf("Scan recent file error: %v", err)
+			continue
+		}
+		files = append(files, file)
+	}
+
+	if err = rows.Err(); err != nil {
+		log.Printf("Rows error: %v", err)
+		writeError(w, http.StatusInternalServerError, "处理文件数据失败")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"data": files,
+	})
+}
+
+
 
 // Helper functions
 func getUploadLock(uploadID string) *sync.Mutex {
@@ -810,10 +993,19 @@ func main() {
 	// File history routes
 	files := api.PathPrefix("/files").Subrouter()
 	files.HandleFunc("/history", GetFileHistory).Methods("GET")
-	files.HandleFunc("/{upload_id}", GetFileDetail).Methods("GET")
+
+
+
+// 新增统计路由
+	files.HandleFunc("/stats", GetFileStats).Methods("GET")
+	files.HandleFunc("/today-stats", GetTodayUploadStats).Methods("GET")
+	files.HandleFunc("/recent", GetRecentFiles).Methods("GET")
+
 
 	// System routes
 	api.HandleFunc("/health", HealthCheck).Methods("GET")
+
+		files.HandleFunc("/{upload_id}", GetFileDetail).Methods("GET")
 
 	// Configure CORS
 	c := cors.New(cors.Options{
@@ -840,6 +1032,10 @@ func main() {
 	log.Println("  PUT    /api/v1/uploads/{upload_id}/chunks/{index}")
 	log.Println("  GET    /api/v1/files/history")
 	log.Println("  GET    /api/v1/files/{upload_id}")
+	log.Println("  GET    /api/v1/files/stats")           // 新增
+	log.Println("  GET    /api/v1/files/today-stats")     // 新增
+	log.Println("  GET    /api/v1/files/recent")          // 新增
+	log.Println("  GET    /api/v1/health")
 	log.Println("  GET    /api/v1/health")
 
 	log.Fatal(srv.ListenAndServe())
