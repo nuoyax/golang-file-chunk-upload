@@ -186,3 +186,37 @@ export interface UploadState {
   progress: number;
   error: string | null;
 }
+
+
+// 文件历史相关类型
+export interface FileHistoryQuery {
+  page?: number;
+  per_page?: number;
+  status?: string;
+  keyword?: string;
+  sort_by?: string;
+  order?: string;
+}
+
+export interface FileRecord {
+  upload_id: string;
+  file_name: string;
+  file_size: number;
+  status: string;
+  chunk_size: number;
+  total_chunks: number;
+  final_path: string;
+  md5?: string;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string;
+}
+
+export interface FileHistoryResponse {
+  total: number;
+  page: number;
+  per_page: number;
+  files: FileRecord[];
+}
+
+// 原有的其他类型保持不变...

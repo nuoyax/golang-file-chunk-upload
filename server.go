@@ -81,6 +81,37 @@ type (
 		Code    int    `json:"code"`
 		Message string `json:"message,omitempty"`
 	}
+
+	// FileHistoryResponse 文件历史记录响应
+	FileHistoryResponse struct {
+		Total   int           `json:"total"`
+		Page    int           `json:"page"`
+		PerPage int           `json:"per_page"`
+		Files   []*FileRecord `json:"files"`
+	}
+
+	// FileRecord 文件记录
+	FileRecord struct {
+		UploadID    string    `json:"upload_id"`
+		FileName    string    `json:"file_name"`
+		FileSize    int64     `json:"file_size"`
+		Status      string    `json:"status"`
+		ChunkSize   int       `json:"chunk_size"`
+		TotalChunks int       `json:"total_chunks"`
+		CreatedAt   time.Time `json:"created_at"`
+		UpdatedAt   time.Time `json:"updated_at"`
+		CompletedAt *time.Time `json:"completed_at,omitempty"`
+	}
+
+	// FileHistoryQuery 文件历史查询参数
+	FileHistoryQuery struct {
+		Page    int    `json:"page"`
+		PerPage int    `json:"per_page"`
+		Status  string `json:"status"`
+		Keyword string `json:"keyword"`
+		SortBy  string `json:"sort_by"`
+		Order   string `json:"order"`
+	}
 )
 
 // Constants
@@ -88,6 +119,10 @@ const (
 	StatusInProgress = "in_progress"
 	StatusCompleted  = "completed"
 	StatusFailed     = "failed"
+
+	DefaultPage    = 1
+	DefaultPerPage = 20
+	MaxPerPage     = 100
 )
 
 // Helper functions
@@ -114,6 +149,50 @@ func writeError(w http.ResponseWriter, status int, message string) {
 		Code:    status,
 		Message: message,
 	})
+}
+
+func parseQueryParams(r *http.Request) *FileHistoryQuery {
+	query := &FileHistoryQuery{
+		Page:    DefaultPage,
+		PerPage: DefaultPerPage,
+		SortBy:  "created_at",
+		Order:   "desc",
+	}
+
+	if pageStr := r.URL.Query().Get("page"); pageStr != "" {
+		if page, err := strconv.Atoi(pageStr); err == nil && page > 0 {
+			query.Page = page
+		}
+	}
+
+	if perPageStr := r.URL.Query().Get("per_page"); perPageStr != "" {
+		if perPage, err := strconv.Atoi(perPageStr); err == nil && perPage > 0 {
+			if perPage > MaxPerPage {
+				perPage = MaxPerPage
+			}
+			query.PerPage = perPage
+		}
+	}
+
+	if status := r.URL.Query().Get("status"); status != "" {
+		query.Status = status
+	}
+
+	if keyword := r.URL.Query().Get("keyword"); keyword != "" {
+		query.Keyword = keyword
+	}
+
+	if sortBy := r.URL.Query().Get("sort_by"); sortBy != "" {
+		query.SortBy = sortBy
+	}
+
+	if order := r.URL.Query().Get("order"); order != "" {
+		if strings.ToLower(order) == "asc" || strings.ToLower(order) == "desc" {
+			query.Order = order
+		}
+	}
+
+	return query
 }
 
 // Database initialization
@@ -374,7 +453,7 @@ func CompleteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update database status
+	// Update database status - 只更新状态，不更新 final_path 和 file_md5
 	_, err = db.Exec(
 		"UPDATE uploads SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE upload_id = ?",
 		StatusCompleted, uploadID,
@@ -398,7 +477,186 @@ func CompleteUpload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// Helper functions for CompleteUpload
+// GetFileHistory 获取文件上传历史记录
+// GET /api/v1/files/history
+func GetFileHistory(w http.ResponseWriter, r *http.Request) {
+	query := parseQueryParams(r)
+
+	// 构建 WHERE 条件
+	whereClause := "WHERE 1=1"
+	args := []interface{}{}
+
+	// 添加过滤器
+	if query.Status != "" {
+		whereClause += " AND status = ?"
+		args = append(args, query.Status)
+	}
+
+	if query.Keyword != "" {
+		whereClause += " AND file_name LIKE ?"
+		args = append(args, "%"+query.Keyword+"%")
+	}
+
+	// 构建排序
+	allowedSortFields := map[string]bool{
+		"created_at":  true,
+		"updated_at":  true,
+		"file_name":   true,
+		"total_size":  true,
+		"total_chunks": true,
+	}
+	
+	sortBy := query.SortBy
+	if !allowedSortFields[sortBy] {
+		sortBy = "created_at"
+	}
+	
+	order := strings.ToUpper(query.Order)
+	if order != "ASC" && order != "DESC" {
+		order = "DESC"
+	}
+	orderBy := fmt.Sprintf("ORDER BY %s %s", sortBy, order)
+
+	// 构建分页
+	offset := (query.Page - 1) * query.PerPage
+	limitClause := "LIMIT ? OFFSET ?"
+
+	// 获取总数
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM uploads %s", whereClause)
+	log.Printf("Count query: %s, args: %v", countQuery, args)
+	
+	var total int
+	err := db.QueryRow(countQuery, args...).Scan(&total)
+	if err != nil {
+		log.Printf("Database count query error: %v", err)
+		writeError(w, http.StatusInternalServerError, "Database count error")
+		return
+	}
+
+	// 如果总数是0，直接返回空结果
+	if total == 0 {
+		resp := FileHistoryResponse{
+			Total:   0,
+			Page:    query.Page,
+			PerPage: query.PerPage,
+			Files:   []*FileRecord{},
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	// 构建数据查询
+	selectQuery := fmt.Sprintf(`
+		SELECT 
+			upload_id, file_name, total_size, chunk_size, total_chunks, 
+			status, created_at, updated_at
+		FROM uploads 
+		%s 
+		%s 
+		%s
+	`, whereClause, orderBy, limitClause)
+
+	// 为数据查询准备参数（需要添加分页参数）
+	queryArgs := make([]interface{}, len(args))
+	copy(queryArgs, args)
+	queryArgs = append(queryArgs, query.PerPage, offset)
+
+	log.Printf("Select query: %s, args: %v", selectQuery, queryArgs)
+
+	// 执行查询
+	rows, err := db.Query(selectQuery, queryArgs...)
+	if err != nil {
+		log.Printf("Database select query error: %v", err)
+		writeError(w, http.StatusInternalServerError, "Database query error")
+		return
+	}
+	defer rows.Close()
+
+	// 处理结果
+	var files []*FileRecord
+	for rows.Next() {
+		file := &FileRecord{}
+		
+		err := rows.Scan(
+			&file.UploadID, &file.FileName, &file.FileSize, &file.ChunkSize, &file.TotalChunks,
+			&file.Status, &file.CreatedAt, &file.UpdatedAt,
+		)
+		if err != nil {
+			log.Printf("Database scan error: %v", err)
+			continue
+		}
+
+		// 为已完成文件设置完成时间
+		if file.Status == StatusCompleted {
+			file.CompletedAt = &file.UpdatedAt
+		}
+
+		files = append(files, file)
+	}
+
+	if err = rows.Err(); err != nil {
+		log.Printf("Database rows error: %v", err)
+		writeError(w, http.StatusInternalServerError, "Database rows error")
+		return
+	}
+
+	// 构建响应
+	resp := FileHistoryResponse{
+		Total:   total,
+		Page:    query.Page,
+		PerPage: query.PerPage,
+		Files:   files,
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// GetFileDetail 获取文件详情
+// GET /api/v1/files/{upload_id}
+func GetFileDetail(w http.ResponseWriter, r *http.Request) {
+	uploadID := mux.Vars(r)["upload_id"]
+
+	file, err := getFileByUploadID(uploadID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeError(w, http.StatusNotFound, "File not found")
+			return
+		}
+		log.Println("Database query error:", err)
+		writeError(w, http.StatusInternalServerError, "Database error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, file)
+}
+
+// Helper functions
+func getFileByUploadID(uploadID string) (*FileRecord, error) {
+	file := &FileRecord{}
+
+	query := `
+		SELECT 
+			upload_id, file_name, total_size, chunk_size, total_chunks, 
+			status, created_at, updated_at
+		FROM uploads 
+		WHERE upload_id = ?
+	`
+
+	err := db.QueryRow(query, uploadID).Scan(
+		&file.UploadID, &file.FileName, &file.FileSize, &file.ChunkSize, &file.TotalChunks,
+		&file.Status, &file.CreatedAt, &file.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if file.Status == StatusCompleted {
+		file.CompletedAt = &file.UpdatedAt
+	}
+
+	return file, nil
+}
+
 func findAndValidateChunks(uploadID string, totalChunks int) ([]string, []int, error) {
 	tmpPath := filepath.Join(tmpDir, uploadID)
 	pattern := filepath.Join(tmpPath, "chunk_*")
@@ -549,6 +807,11 @@ func main() {
 	uploads.HandleFunc("/{upload_id}/complete", CompleteUpload).Methods("POST")
 	uploads.HandleFunc("/{upload_id}/chunks/{index}", UploadChunk).Methods("PUT", "POST")
 
+	// File history routes
+	files := api.PathPrefix("/files").Subrouter()
+	files.HandleFunc("/history", GetFileHistory).Methods("GET")
+	files.HandleFunc("/{upload_id}", GetFileDetail).Methods("GET")
+
 	// System routes
 	api.HandleFunc("/health", HealthCheck).Methods("GET")
 
@@ -575,6 +838,8 @@ func main() {
 	log.Println("  GET    /api/v1/uploads/{upload_id}")
 	log.Println("  POST   /api/v1/uploads/{upload_id}/complete")
 	log.Println("  PUT    /api/v1/uploads/{upload_id}/chunks/{index}")
+	log.Println("  GET    /api/v1/files/history")
+	log.Println("  GET    /api/v1/files/{upload_id}")
 	log.Println("  GET    /api/v1/health")
 
 	log.Fatal(srv.ListenAndServe())
