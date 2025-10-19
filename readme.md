@@ -5,6 +5,11 @@
 [![Gorilla Mux](https://img.shields.io/badge/Gorilla_Mux-000000?logo=go&logoColor=white)](https://github.com/gorilla/mux) 
 [![rs/cors](https://img.shields.io/badge/rs/cors-000000?logo=go&logoColor=white)](https://github.com/rs/cors) 
 [![go-sql-driver/mysql](https://img.shields.io/badge/go--sql--driver/mysql-000000?logo=mysql&logoColor=white)](https://github.com/go-sql-driver/mysql)
+[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+[![WeChat](https://img.shields.io/badge/WeChat-07C160?logo=wechat&logoColor=white)](你的微信链接)
+
+
+
 
 一个用 Go 语言编写的强大且可扩展的文件上传服务，旨在通过分片上传处理大文件上传，支持断点续传、进度跟踪和文件历史管理。服务使用 MySQL 数据库存储元数据，并提供 RESTful API 用于创建上传任务、上传分片、检查上传状态以及获取文件历史和统计信息。
 
